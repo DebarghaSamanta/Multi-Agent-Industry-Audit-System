@@ -62,7 +62,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # You can change this query to any of the test cases we discussed
-    test_query = "Analyze the unit economics of Project Olympus AI. I need their LTV/CAC ratio and their current ARR."
+    test_query = "Evaluate Glean's competitive position against Microsoft Copilot and Perplexity for Enterprise. Focus on 'Switching Costs' and 'Data Advantage.' Is there evidence of customer churn from legacy intranet providers moving to Glean?"
 
     initial_input = {
         "topic": test_query,

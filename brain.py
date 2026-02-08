@@ -1,21 +1,27 @@
 import os
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
 from shared import ResearchState
 import json
 load_dotenv()
 
 # 1. Setup the OpenRouter Brain
-api_key = os.getenv("OPENROUTER_API_KEY")
+api_key = os.getenv("GROQ_API_KEY")
 
 # 2. Safety Check: If this prints 'None', your .env file is the problem
 print(f">>> DEBUG: API Key Loaded: {'Yes' if api_key else 'No'}")
 
 if not api_key:
-    raise ValueError("OPENROUTER_API_KEY not found! Check your .env file.")
+    raise ValueError("GROQ_API_KEY not found! Check your .env file.")
 
 # 3. Initialize the Brain
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    api_key=api_key,  # Explicitly pass the variable we just checked
+    temperature=0  # Keeping it at 0 for strict auditing
+)
+"""
 llm = ChatOpenAI(
     model="openai/gpt-oss-120b:free", 
     api_key=api_key, # Explicitly pass the variable we just checked
@@ -25,6 +31,8 @@ llm = ChatOpenAI(
         "X-Title": "AI Auditor Project",
     }
 )
+"""
+
 
 # 2. Setup the Search Tool
 search_tool = TavilySearch(max_results=2)
