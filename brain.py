@@ -8,7 +8,7 @@ load_dotenv()
 
 # 1. Setup the OpenRouter Brain
 api_key = os.getenv("GROQ_API_KEY")
-
+#api_key_openrouter = os.getenv("OPENROUTER_API_KEY")
 # 2. Safety Check: If this prints 'None', your .env file is the problem
 print(f">>> DEBUG: API Key Loaded: {'Yes' if api_key else 'No'}")
 
