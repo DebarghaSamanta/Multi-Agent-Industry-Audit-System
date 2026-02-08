@@ -37,6 +37,27 @@ def researcher_node(state: ResearchState):
     # We save the results into the notebook
     return {"raw_data": [str(results)], "iterations": state.get("iterations", 0) + 1}
 
+# agents.py (Add this function)
+
+def planner_node(state: ResearchState):
+    print("--- 🧠 AGENT: PLANNER IS STRATEGIZING ---")
+    topic = state["topic"]
+    
+    prompt = f"""
+    You are a Research Planner. Your goal is to break down the topic '{topic}' into 3 distinct search queries.
+    Focus on:
+    1. Current status (2025-2026).
+    2. Financial or technical details.
+    3. Potential controversies or upcoming milestones.
+    
+    Respond with ONLY the 3 queries, one per line.
+    """
+    
+    response = llm.invoke(prompt)
+    # Split the response into a list of 3 strings
+    queries = response.content.strip().split("\n")
+    
+    return {"plan": queries}
 # Agent 2: The Auditor (Verifier)
 def auditor_node(state: ResearchState):
     print("--- ⚖️ AGENT: AUDITOR IS CHECKING FOR HALLUCINATIONS ---")
