@@ -86,6 +86,7 @@ def researcher_node(state: ResearchState):
 
 def planner_node(state: ResearchState):
     print("--- 🧠 AGENT: PLANNER IS STRATEGIZING ---")
+    #raise Exception("SIMULATED CRASH FOR MEMORY TEST")
     topic = state["topic"]
     
     prompt = f"""
