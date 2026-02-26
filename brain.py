@@ -3,14 +3,11 @@ import json
 from dotenv import load_dotenv
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_openai import ChatOpenAI
-
 from ragas.llms import LangchainLLMWrapper
 from ragas import evaluate
 from ragas.metrics import faithfulness, answer_relevancy
 from datasets import Dataset
 from langchain_community.embeddings import DeterministicFakeEmbedding
-
-# Import State
 from shared import ResearchState
 
 load_dotenv()
@@ -32,7 +29,6 @@ llm = ChatOpenAI(
     }
 )
 
-# FIX: Use TavilySearchResults (Returns List[Dict]) instead of TavilySearch (Returns String)
 search_tool = TavilySearchResults(max_results=5)
 
 # --- 2. AGENT NODES ---
@@ -42,7 +38,7 @@ def planner_node(state: ResearchState):
     topic = state["topic"]
     critique = state.get("critique")
     
-    # CASE 1: RE-PLANNING (Fixing the Gaps)
+    
     if critique:
         print(f"⚠️ FEEDBACK RECEIVED: {critique}")
         prompt = f"""
@@ -62,7 +58,7 @@ def planner_node(state: ResearchState):
         Return ONLY 3 queries, one per line.
         """
         
-    # CASE 2: FIRST RUN (Standard Strategy)
+    
     else:
         prompt = f"""
         ### ROLE
@@ -94,11 +90,11 @@ def researcher_node(state: ResearchState):
     for search_query in state["plan"]:
         print(f"Searching: {search_query}")
         try:
-            # This now returns a LIST of dictionaries guaranteed
+            
             results = search_tool.invoke(search_query)
 
             for r in results:
-                # This loop caused the crash before because 'r' was a letter, not a dict
+                
                 all_context.append(f"[SOURCE: {r.get('url')}]\n{r.get('content')}")
                 
         except Exception as e:
