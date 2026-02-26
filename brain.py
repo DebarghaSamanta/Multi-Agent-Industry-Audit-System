@@ -1,12 +1,9 @@
 import os
 import json
 from dotenv import load_dotenv
-
-# --- THE CRITICAL FIX: Use the specific tool that returns a List, not a String ---
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_openai import ChatOpenAI
 
-# RAGAS Imports
 from ragas.llms import LangchainLLMWrapper
 from ragas import evaluate
 from ragas.metrics import faithfulness, answer_relevancy
