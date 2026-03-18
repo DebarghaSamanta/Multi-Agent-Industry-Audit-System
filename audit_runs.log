@@ -15,3 +15,20 @@ HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200
 {"ts": 1773843897.866557, "event": "eval_scores", "faithfulness": 0.64, "total": 14, "supported": 9}
 {"ts": 1773843897.8730872, "event": "node_start", "node": "reporter"}
 {"ts": 1773843897.8794327, "event": "report_generated", "grade": "C", "confidence_pct": 48, "data_gaps": 2, "risk_flags": 5}
+{"ts": 1773844168.0434139, "event": "run_start", "thread_id": "audit_d272a83b"}
+{"ts": 1773844168.1664312, "event": "node_start", "node": "planner", "iteration": 0}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773844168.58926, "event": "node_done", "node": "planner", "queries": ["Tesla revenue growth 2024-2025 and profit margins analysis", "Tesla market share in global electric vehicle industry and competitors 2024", "Tesla lawsuits and regulatory issues affecting revenue growth 2024-2025"]}
+{"ts": 1773844205.2050242, "event": "node_start", "node": "researcher", "num_queries": 3}
+{"ts": 1773844207.2741282, "event": "search_done", "parallel_ms": 2068, "chunks_collected": 15}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773844208.2879698, "event": "node_done", "node": "researcher", "sources_cited": 15}
+{"ts": 1773844208.3094735, "event": "node_start", "node": "auditor", "model": "llama-3.3-70b-versatile"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773844208.6148272, "event": "node_done", "node": "auditor", "is_verified": true}
+{"ts": 1773844208.6148272, "event": "router_decision", "decision": "verified", "iterations": 1}
+{"ts": 1773844208.6343842, "event": "node_start", "node": "evaluator"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773844208.9383476, "event": "eval_scores", "faithfulness": 0.75, "total": 12, "supported": 9}
+{"ts": 1773844208.9452615, "event": "node_start", "node": "reporter"}
+{"ts": 1773844208.9522216, "event": "report_generated", "grade": "B", "confidence_pct": 59, "data_gaps": 2, "risk_flags": 2}
