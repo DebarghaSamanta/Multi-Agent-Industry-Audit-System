@@ -1,131 +1,221 @@
 import os
+import time
+import uuid
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
 
-# Import your custom modules
 from shared import ResearchState
-from brain import evaluator_node, researcher_node, auditor_node, planner_node
+from brain import (
+    evaluator_node,
+    researcher_node,
+    auditor_node,
+    planner_node,
+    reporter_node,
+    persist_run,
+    print_pass_rate_summary,
+    log,
+)
 
-# 1. Initialize the Graph
+# ---------------------------------------------------------------------------
+# 1. Build the graph
+# ---------------------------------------------------------------------------
 workflow = StateGraph(ResearchState)
 
-# 2. Register our Agents (Nodes)
 workflow.add_node("planner", planner_node)
 workflow.add_node("researcher", researcher_node)
 workflow.add_node("auditor", auditor_node)
+workflow.add_node("evaluator", evaluator_node)
+workflow.add_node("reporter", reporter_node)
 
-# 3. Define the Orchestration (The "Office Rules")
+workflow.add_edge("evaluator", "reporter")
+workflow.add_edge("reporter", END)
+
 workflow.set_entry_point("planner")
 workflow.add_edge("planner", "researcher")
 workflow.add_edge("researcher", "auditor")
-workflow.add_edge("evaluator", END)
-# 4. The Decision Logic (The "Router")
-def router(state: ResearchState):
-    # --- X-RAY DEBUGGING START ---
-    print("\n" + "!"*30)
-    print(f"👀 ROUTER RECEIVED TYPE: {type(state)}")
-    print(f"👀 ROUTER RECEIVED DATA: {state}")
-    print("!"*30 + "\n")
-    # --- X-RAY DEBUGGING END ---
 
-    # If this prints <class 'str'>, we know the Auditor returned a string.
-    # If this prints <class 'dict'>, then the error is somewhere else.
-    
-    if isinstance(state, str):
-        print("🚨 CRITICAL ERROR: Router received a string. Defaulting to 'planner'.")
-        return "planner"
 
+# ---------------------------------------------------------------------------
+# 2. Router
+# ---------------------------------------------------------------------------
+def router(state: ResearchState) -> str:
     if state.get("is_verified"):
-        print("\n✅ AUDIT SUCCESSFUL.")
+        log("router_decision", decision="verified", iterations=state.get("iterations"))
+        print("\n  AUDIT PASSED — sending to evaluator")
         return "end"
-    
+
     if state.get("iterations", 0) >= 3:
-        print("\n🚨 CRITICAL: Max iterations reached.")
+        log("router_decision", decision="max_iterations_reached")
+        print("\n  Max iterations reached — forcing evaluation with current data")
         return "end"
-    
-    print(f"\n❌ AUDIT REJECTED: {state.get('critique', 'No critique found')}")
+
+    log("router_decision", decision="retry", critique=state.get("critique", "")[:80])
+    print(f"\n  Audit rejected — retrying. Critique: {state.get('critique', '')}")
     return "planner"
 
-# 5. Connect the Router to the Graph
+
 workflow.add_conditional_edges(
-    "auditor", 
-    router, 
-    {
-        "end": 'evaluator', 
-        "planner": "planner"
-    }
+    "auditor",
+    router,
+    {"end": "evaluator", "planner": "planner"},
 )
-workflow.add_node("evaluator", evaluator_node)
-#adding memeory layer
+
+# ---------------------------------------------------------------------------
+# 3. Memory
+# ---------------------------------------------------------------------------
 memory_context = SqliteSaver.from_conn_string("checkpoints.db")
 
 
-# 7. Execution Block: This is where you write your questions
+# ---------------------------------------------------------------------------
+# 4. Helpers
+# ---------------------------------------------------------------------------
+def _drain(app, config):
+    """Stream all remaining nodes, printing each one as it finishes."""
+    for output in app.stream(None, config=config):
+        for node_name, state_update in output.items():
+            if node_name == "__interrupt__":
+                continue
+            print(f"  [Node done] {node_name.upper()}")
+            if node_name == "planner":
+                print(f"    Queries: {state_update.get('plan')}")
+            elif node_name == "auditor" and not state_update.get("is_verified"):
+                print(f"    Red flag: {state_update.get('critique')}")
+
+
+def _handle_interrupt(app, config) -> bool:
+    """
+    Show the current plan, ask the user what to do.
+    Returns True if execution should continue, False if user chose EXIT.
+    On every EDIT or GO the graph resumes and may hit another interrupt
+    (retry loop) — we keep looping until no more interrupts remain.
+    """
+    while True:
+        snapshot = app.get_state(config)
+        if not snapshot.next:
+            return True  # graph finished cleanly, nothing to handle
+
+        # Only show the HUMAN REVIEW banner when paused before researcher
+        if "researcher" not in snapshot.next:
+            # Paused somewhere else (shouldn't normally happen) — just resume
+            _drain(app, config)
+            continue
+
+        plan = snapshot.values.get("plan", [])
+        print("\n" + " HUMAN REVIEW REQUIRED ".center(55, "-"))
+        print(f"  Planner proposed {len(plan)} search queries:")
+        for i, q in enumerate(plan, 1):
+            print(f"    {i}. {q}")
+
+        choice = input(
+            "\n  Type GO to proceed, EDIT to add a query, or EXIT to stop: "
+        ).strip().lower()
+
+        if choice == "exit":
+            print("  Execution stopped. Run again to resume this thread.")
+            return False
+
+        if choice == "edit":
+            new_query = input("  Enter your custom query: ").strip()
+            plan.append(new_query)
+            app.update_state(config, {"plan": plan})
+            print(f"  Query added. New plan has {len(plan)} queries.")
+
+        # GO or after EDIT — resume and drain until next interrupt or completion
+        print("  Resuming research...")
+        for output in app.stream(None, config=config):
+            for node_name, state_update in output.items():
+                if node_name == "__interrupt__":
+                    break  # hit another interrupt, fall back to top of while loop
+                print(f"  [Node done] {node_name.upper()}")
+                if node_name == "planner":
+                    print(f"    Queries: {state_update.get('plan')}")
+                elif node_name == "auditor" and not state_update.get("is_verified"):
+                    print(f"    Red flag: {state_update.get('critique')}")
+            else:
+                continue
+            break  # inner break propagated — go back to top of while to re-check
+
+        # After draining, loop back and check if there is another interrupt
+
+
+# ---------------------------------------------------------------------------
+# 5. Main execution
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     load_dotenv()
-    with memory_context as saver:
-        app = workflow.compile(checkpointer=saver,interrupt_before=["researcher"])
 
-        print("="*60)
-        print("🚀 ENTERPRISE DUE DILIGENCE AGENT (VERSION 2026.1)")
-        print("="*60)
-        config = {"configurable": {"thread_id": "audit_001"}}
-        # You can change this query to any of the test cases we discussed
-        test_query = "Analyze Tesla's 2024-2025 revenue growth and their current market share in the global EV market."
+    with memory_context as saver:
+        app = workflow.compile(
+            checkpointer=saver,
+            interrupt_before=["researcher"],
+        )
+
+        print("=" * 60)
+        print("  ENTERPRISE DUE DILIGENCE AGENT  v2026.2")
+        print("=" * 60)
+
+        # Fresh thread ID every run — avoids replaying old checkpoints
+        thread_id = f"audit_{uuid.uuid4().hex[:8]}"
+        config = {"configurable": {"thread_id": thread_id}}
+        log("run_start", thread_id=thread_id)
+
+        test_query = (
+            "Analyze Tesla's 2024-2025 revenue growth and their "
+            "current market share in the global EV market."
+        )
 
         initial_input = {
             "topic": test_query,
             "iterations": 0,
             "is_verified": False,
             "plan": [],
-            "raw_data": []
+            "raw_data": [],
+            "faithfulness_score": 0.0,
+            "relevancy_score": 0.0,
         }
 
-        print(f"Target: {test_query}\n")
+        print(f"  Target: {test_query}\n")
+        run_start = time.perf_counter()
 
-        # We use streaming so you can see the 'thinking' process in the terminal
         try:
-            for output in app.stream(initial_input,config=config):
+            # Phase 1 — run until first interrupt (always before researcher)
+            for output in app.stream(initial_input, config=config):
                 for node_name, state_update in output.items():
-                    print(f"📍 Finished Node: {node_name.upper()}")
-                    
-                    # Visual debug for your resume/portfolio
+                    if node_name == "__interrupt__":
+                        continue
+                    print(f"  [Node done] {node_name.upper()}")
                     if node_name == "planner":
-                        print(f"   Strategy: {state_update.get('plan')}")
-                    elif node_name == "auditor" and not state_update.get("is_verified"):
-                        print(f"   Red Flags: {state_update.get('critique')}")
-            snapshot = app.get_state(config)
-            if snapshot.next: # This checks if the graph is currently PAUSED
-                print("\n" + "🛑" * 10 + " HUMAN REVIEW REQUIRED " + "🛑" * 10)
-                print(f"The Planner has suggested {len(snapshot.values['plan'])} search queries.")
-                
-                choice = input("\nType 'GO' to proceed, or 'EXIT' to stop or 'EDIT' to add a query: ").strip().lower()
-                if choice == "edit":
-                    current_plan = snapshot.values.get("plan", [])
-                    new_query = input("Enter your custom search query: ")
-                    current_plan.append(new_query)
-                    app.update_state(config, {"plan": current_plan})
-                    for output in app.stream(None, config=config):
-                        for node_name, state_update in output.items():
-                            print(f"📍 Finished Node: {node_name.upper()}")
-                    print(f"✅ Query Added! Current Plan: {current_plan}")
-                elif choice == "go":
-                    print("🚀 Resuming Research...")
-                    # Passing None tells the graph to pick up from where it was interrupted
-                    for output in app.stream(None, config=config):
-                        for node_name, state_update in output.items():
-                            print(f"📍 Finished Node: {node_name.upper()}")
-                else:
-                    print("Stopping execution. You can resume this thread later.")
-            # Final Result Extraction
-            # We run the app one last time to get the final state
-            final_state = app.invoke(None,config=config)  # No new input, just get the final state
-            
-            print("\n" + "⭐" * 20 + " FINAL VERIFIED REPORT " + "⭐" * 20)
-            print(final_state.get("draft_report", "Research failed to generate report."))
-            print("="*60)
+                        print(f"    Queries planned: {state_update.get('plan')}")
 
-        except Exception as e:
-            print(f"❌ System Crash: {e}")
+            # Phase 2 — handle ALL interrupts (retry loop may re-interrupt)
+            should_continue = _handle_interrupt(app, config)
+            if not should_continue:
+                raise SystemExit(0)
+
+            # Phase 3 — graph is done, read final state once
+            final_state = app.get_state(config).values
+            run_latency_ms = int((time.perf_counter() - run_start) * 1000)
+
+            persist_run(final_state, run_latency_ms)
+
+            print("\n" + " FINAL VERIFIED REPORT ".center(55, "="))
+            print(final_state.get("draft_report", "No report generated."))
+            print("\n" + " VERDICT ".center(55, "="))
+            print(f"  Investment grade : {final_state.get('investment_grade', 'N/A')}")
+            print(f"  Confidence       : {final_state.get('confidence_pct', 0)}%")
+            print(f"  Faithfulness     : {final_state.get('faithfulness_score', 0.0):.2f}")
+            print(f"  Data gaps        : {final_state.get('data_gap_count', 0)}")
+            print(f"  Risk flags       : {final_state.get('risk_flag_count', 0)}")
+            print(f"  Sources cited    : {final_state.get('sources_cited', 0)}")
+            print(f"  Total latency    : {run_latency_ms}ms")
+            print("=" * 55)
+
+            print_pass_rate_summary()
+
+        except SystemExit:
+            pass
+        except Exception as exc:
+            log("system_crash", error=str(exc))
+            print(f"\n  System error: {exc}")
+            raise

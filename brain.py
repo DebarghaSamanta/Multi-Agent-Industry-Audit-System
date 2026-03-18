@@ -1,200 +1,465 @@
 import os
 import json
+import logging
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from dotenv import load_dotenv
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_openai import ChatOpenAI
-from ragas.llms import LangchainLLMWrapper
-from ragas import evaluate
-from ragas.metrics import faithfulness, answer_relevancy
-from datasets import Dataset
-from langchain_community.embeddings import DeterministicFakeEmbedding
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from langchain_tavily import TavilySearch
+from langchain_groq import ChatGroq
+
 from shared import ResearchState
 
 load_dotenv()
 
-# --- 1. SETUP BRAIN & TOOLS ---
-api_key_openrouter = os.getenv("OPENROUTER_API_KEY")
-
-if not api_key_openrouter:
-    raise ValueError("OPENROUTER_API_KEY not found! Check your .env file.")
-
-llm = ChatOpenAI(
-    model="openai/gpt-oss-120b:free", 
-    api_key=api_key_openrouter,
-    base_url="https://openrouter.ai/api/v1",
-    n=1,
-    default_headers={
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "AI Auditor Project",
-    }
+# ---------------------------------------------------------------------------
+# Structured logging — every event is JSON so logs are queryable later
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("audit_runs.log"),
+    ],
 )
 
-search_tool = TavilySearchResults(max_results=5)
+def log(event: str, **kwargs):
+    """Emit a structured JSON log line."""
+    record = {"ts": time.time(), "event": event, **kwargs}
+    logging.info(json.dumps(record))
 
-# --- 2. AGENT NODES ---
+
+# ---------------------------------------------------------------------------
+# SQLite eval + latency log (separate from LangGraph checkpoints)
+# ---------------------------------------------------------------------------
+DB_PATH = "checkpoints.db"
+
+def _init_db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           REAL,
+            topic        TEXT,
+            iterations   INTEGER,
+            is_verified  INTEGER,
+            faithfulness REAL,
+            relevancy    REAL,
+            grade        TEXT,
+            confidence   INTEGER,
+            data_gaps    INTEGER,
+            latency_ms   INTEGER,
+            critique     TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+_init_db()
+
+
+def persist_run(state: ResearchState, latency_ms: int):
+    """Write one completed run to the runs table."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        """INSERT INTO runs
+           (ts, topic, iterations, is_verified, faithfulness, relevancy,
+            grade, confidence, data_gaps, latency_ms, critique)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            time.time(),
+            state.get("topic", ""),
+            state.get("iterations", 0),
+            int(state.get("is_verified", False)),
+            state.get("faithfulness_score", 0.0),
+            state.get("relevancy_score", 0.0),
+            state.get("investment_grade", "N/A"),
+            state.get("confidence_pct", 0),
+            state.get("data_gap_count", 0),
+            latency_ms,
+            state.get("critique", ""),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def print_pass_rate_summary():
+    """Print a quick dashboard of the last 20 runs."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("""
+        SELECT
+            ROUND(100.0 * SUM(iterations=1) / COUNT(*), 1) AS first_pass_pct,
+            ROUND(AVG(iterations), 2)                       AS avg_iterations,
+            ROUND(100.0 * SUM(iterations>=3) / COUNT(*), 1) AS max_iter_failure_pct,
+            ROUND(AVG(faithfulness), 2)                     AS avg_faithfulness,
+            ROUND(AVG(latency_ms) / 1000.0, 1)              AS avg_latency_s,
+            COUNT(*)                                         AS total_runs
+        FROM (SELECT * FROM runs ORDER BY id DESC LIMIT 20)
+    """).fetchone()
+    con.close()
+    if rows and rows[5]:
+        print("\n" + "=" * 55)
+        print("  AUDIT SYSTEM — LAST 20 RUNS DASHBOARD")
+        print("=" * 55)
+        print(f"  Total runs logged   : {rows[5]}")
+        print(f"  First-pass rate     : {rows[0]}%")
+        print(f"  Avg iterations/run  : {rows[1]}")
+        print(f"  Max-iter failure    : {rows[2]}%")
+        print(f"  Avg faithfulness    : {rows[3]}")
+        print(f"  Avg latency         : {rows[4]}s")
+        print("=" * 55 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# LLM setup
+# ---------------------------------------------------------------------------
+api_key_groq = os.getenv("GROQ_API_KEY")
+if not api_key_groq:
+    raise ValueError("GROQ_API_KEY not found — check your .env file.")
+
+# Main LLM — llama-3.3-70b is Groq's fastest free model, well above GPT-3.5 quality
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    api_key=api_key_groq,
+    temperature=0,
+)
+
+# Auditor LLM — swap via AUDIT_MODEL env var to A/B test cost vs accuracy
+# e.g. AUDIT_MODEL=llama3-8b-8192 for a fast cheap auditor
+AUDIT_MODEL = os.getenv("AUDIT_MODEL", "llama-3.3-70b-versatile")
+auditor_llm = ChatGroq(
+    model=AUDIT_MODEL,
+    api_key=api_key_groq,
+    temperature=0,
+)
+
+# Official docs: tool.invoke({"query": "..."}) returns a dict:
+# {"query":str, "results":[{"title","url","content","score","raw_content"},...], ...}
+search_tool = TavilySearch(max_results=5, topic="general")
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _tavily_search(query: str) -> dict:
+    # Pass as dict — this is the format confirmed in official docs
+    return search_tool.invoke({"query": query})
+
+
+# ---------------------------------------------------------------------------
+# AGENT NODES
+# ---------------------------------------------------------------------------
 
 def planner_node(state: ResearchState):
-    print(f"\n--- 🧠 AGENT: PLANNER (Iteration {state.get('iterations', 0)}) ---")
+    iteration = state.get("iterations", 0)
+    log("node_start", node="planner", iteration=iteration)
+    print(f"\n--- AGENT: PLANNER (Iteration {iteration}) ---")
+
     topic = state["topic"]
     critique = state.get("critique")
-    
-    
+
     if critique:
-        print(f"⚠️ FEEDBACK RECEIVED: {critique}")
+        print(f"  Feedback received: {critique}")
         prompt = f"""
         ### ROLE
         Senior Researcher (Recovery Mode).
-        
+
         ### CONTEXT
-        The previous research failed.
-        Critique: {critique}
-        
+        Original research topic: "{topic}"
+        The previous research attempt failed with this critique: {critique}
+
         ### TASK
-        Generate 3 NEW, SPECIFIC search queries to fix the missing data mentioned in the critique.
-        - If "Revenue" is missing, search for "Investor Presentation" or "10-K".
-        - If "LTV/CAC" is missing, search for "Unit Economics" or "Profitability".
-        
+        Generate 3 NEW, SPECIFIC search queries about "{topic}" to fix the missing data.
+        Queries MUST include the company name from the topic — never use placeholder text.
+        - If revenue is missing: search for the company's specific annual report or 10-K filing.
+        - If market share is missing: search for the company's specific competitive position.
+
         ### OUTPUT
-        Return ONLY 3 queries, one per line.
+        Return ONLY 3 queries, one per line. No numbering, no bullets.
         """
-        
-    
     else:
         prompt = f"""
         ### ROLE
         Lead Investment Strategist.
-        
+
         ### TASK
         Generate 3 distinct search queries to gather data on: "{topic}".
-        
+
         ### STRATEGY
         - Query 1: Broad search for "Revenue", "Growth", "Margins".
         - Query 2: Competitive search for "Market Share", "Competitors".
         - Query 3: Risk search for "Lawsuits", "Regulatory Issues".
-        
+
         ### OUTPUT
-        Return ONLY 3 queries, one per line.
+        Return ONLY 3 queries, one per line. No numbering, no bullets.
         """
 
     response = llm.invoke(prompt)
-    queries = response.content.strip().split("\n")
-    
-    return {"plan": queries, "iterations": state.get("iterations", 0) + 1}
+    queries = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+    log("node_done", node="planner", queries=queries)
+    return {"plan": queries, "iterations": iteration + 1}
 
 
 def researcher_node(state: ResearchState):
-    print(f"--- 🔍 AGENT: RESEARCHER EXECUTING {len(state['plan'])} QUERIES ---")
-    
-    all_context = []
+    """Run all queries in parallel using ThreadPoolExecutor for a ~3x speedup."""
+    log("node_start", node="researcher", num_queries=len(state["plan"]))
+    print(f"\n--- AGENT: RESEARCHER — {len(state['plan'])} queries (parallel) ---")
 
-    for search_query in state["plan"]:
-        print(f"Searching: {search_query}")
+    t0 = time.perf_counter()
+
+    def _search_one(query: str):
+        print(f"  Searching: {query}")
         try:
-            
-            results = search_tool.invoke(search_query)
+            response = _tavily_search(query)
+            # Docs confirm: invoke({"query":...}) returns a plain dict
+            # {"query":str, "results":[{"title","url","content","score"},...]}
+            if not isinstance(response, dict):
+                log("search_warn", query=query, got=type(response).__name__)
+                return []
+            if "error" in response:
+                log("search_warn", query=query, error=str(response["error"]))
+                return []
+            chunks = []
+            for r in response.get("results", []):
+                url     = r.get("url", "unknown")
+                content = r.get("content", "")
+                chunks.append(f"[SOURCE: {url}]\n{content}")
+            return chunks
+        except Exception as exc:
+            log("search_error", query=query, error=str(exc))
+            print(f"  Search failed: {query} — {exc}")
+            return []
 
-            for r in results:
-                
-                all_context.append(f"[SOURCE: {r.get('url')}]\n{r.get('content')}")
-                
-        except Exception as e:
-            print(f"⚠️ Search failed for query '{search_query}': {e}")
+    all_context = []
+    with ThreadPoolExecutor(max_workers=len(state["plan"])) as pool:
+        futures = {pool.submit(_search_one, q): q for q in state["plan"]}
+        for future in as_completed(futures):
+            all_context.extend(future.result())
 
-    # Build cleaner context
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    log("search_done", parallel_ms=elapsed_ms, chunks_collected=len(all_context))
+    print(f"  Parallel search completed in {elapsed_ms}ms ({len(all_context)} chunks)")
+
     combined_context = "\n\n".join(all_context)
+    sources_cited = sum(1 for c in all_context if c.startswith("[SOURCE:"))
 
-    # Extraction Logic
     extraction_prompt = f"""
     ### ROLE
     Senior Data Extraction Engine (VC Domain).
 
     ### TASK
-    Extract metrics from these Search Results regarding '{state['topic']}': 
+    Extract metrics from these search results regarding '{state['topic']}':
     {combined_context}
 
     ### EXTRACTION RULES
-    1. Look for the specific metrics requested in the original topic: "{state['topic']}".
-    2. Additionally, fill out the standard VC Checklist if data is available:
-    - Traction, Moat, Legal.
-    3. If a specific metric requested by the user is NOT found, write "DATA_GAP: [Metric Name]".
+    1. Extract the specific metrics mentioned in the topic: "{state['topic']}".
+    2. Fill the standard VC checklist where data is available: Traction, Moat, Legal risks.
+    3. For every metric NOT found in the sources, write exactly: DATA_GAP: [Metric Name]
+    4. Count and list every URL you drew a fact from.
 
-    ### OUTPUT
-    A structured bullet-point list.
+    ### OUTPUT FORMAT
+    Return a structured bullet-point list. End with a line: SOURCES_USED: N
     """
-    
+
     response = llm.invoke(extraction_prompt)
-    
+    log("node_done", node="researcher", sources_cited=sources_cited)
+
     return {
         "raw_data": [combined_context],
-        "draft_report": response.content
+        "draft_report": response.content,
+        "sources_cited": sources_cited,
     }
 
 
 def auditor_node(state: ResearchState):
-    print("--- ⚖️ AGENT: CHIEF AUDITOR IS REVIEWING ---")
-    
+    log("node_start", node="auditor", model=AUDIT_MODEL)
+    print(f"\n--- AGENT: CHIEF AUDITOR (model: {AUDIT_MODEL}) ---")
+
     audit_prompt = f"""
     ### ROLE
     Chief Investment Compliance Officer.
-    
+
     ### TASK
-    Review these search results against the draft report.
-    Raw Data: {state.get('raw_data')[-1] if state.get('raw_data') else 'No Data'}
-    Draft Report: {state.get('draft_report')}
-    
-    ### OUTPUT JSON
+    Cross-check the draft report against the raw source data below.
+    Raw Data: {str(state.get('raw_data', ['No Data']))[:3000]}
+    Draft Report: {state.get('draft_report', '')}
+
+    ### VERIFICATION RULES
+    1. Mark is_verified=true if the report contains at least 3 concrete facts sourced from the raw data.
+    2. DATA_GAP entries are ACCEPTABLE — they show the system is honest about missing data.
+    3. Only mark is_verified=false if the report contains facts that CONTRADICT the raw data, or if fewer than 3 facts are sourced.
+    4. Do NOT reject just because some metrics are missing — partial data is normal.
+
+    ### STRICT OUTPUT — return ONLY valid JSON, no markdown fences:
     {{
-        "is_verified": boolean,
-        "critique": "string reason for rejection",
-        "missing_metrics": ["list", "of", "metrics"]
+        "is_verified": true or false,
+        "critique": "one sentence reason for rejection only if false, else empty string",
+        "missing_metrics": ["only truly critical missing items"]
     }}
     """
-    
-    response = llm.invoke(audit_prompt)
-    
+
+    response = auditor_llm.invoke(audit_prompt)
+
     try:
-        clean_content = response.content.replace("```json", "").replace("```", "").strip()
-        audit_results = json.loads(clean_content)
-    except:
-        print("⚠️ AUDITOR JSON PARSING FAILED - Defaulting to Retry")
+        clean = response.content.replace("```json", "").replace("```", "").strip()
+        audit_results = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        # Specific exception — don't swallow network/timeout errors
+        log("auditor_parse_error", raw=response.content[:200], error=str(exc))
+        print(f"  Auditor JSON parse failed: {exc} — defaulting to retry")
         audit_results = {
-            "is_verified": False, 
-            "critique": "Auditor failed to parse JSON output.",
-            "missing_metrics": []
+            "is_verified": False,
+            "critique": "Auditor output was not valid JSON.",
+            "missing_metrics": [],
         }
-    
-    # Returns a DICTIONARY (Fixes the Router Crash)
+
+    log("node_done", node="auditor", is_verified=audit_results.get("is_verified"))
     return {
         "is_verified": audit_results.get("is_verified", False),
-        "critique": audit_results.get("critique", "Unknown Error")
+        "critique": audit_results.get("critique", ""),
     }
 
 
 def evaluator_node(state: ResearchState):
-    print("--- 📊 AGENT: RAGAS EVALUATOR IS SCORING ---")
+    """
+    Direct faithfulness scorer — replaces RAGAS to avoid Groq n>1 400 errors.
 
-    judge_llm = LangchainLLMWrapper(llm)
-    fake_embeddings = DeterministicFakeEmbedding(size=1536)
-    
-    data_sample = {
-        "question": [state["topic"]],
-        "answer": [state["draft_report"]],
-        "contexts": [state["raw_data"]],
-    }
-    
-    dataset = Dataset.from_dict(data_sample)
+    Logic: ask the LLM to score each claim in the draft against the sources.
+    Returns a 0.0-1.0 faithfulness score we fully control.
+    """
+    log("node_start", node="evaluator")
+    print("\n--- AGENT: EVALUATOR — scoring faithfulness ---")
+
+    draft   = state.get("draft_report", "")[:1200]
+    sources = " ".join(state.get("raw_data", []))[:2000]
+
+    if not sources.strip():
+        log("evaluator_skip", reason="no source data")
+        print("  No source data — skipping evaluation")
+        return {"eval_score": "No sources", "faithfulness_score": 0.0, "relevancy_score": 0.0}
+
+    scoring_prompt = f"""
+    ### ROLE
+    Objective Research Quality Auditor.
+
+    ### TASK
+    Score how faithful this research report is to its source data.
+
+    Source Data (truncated):
+    {sources}
+
+    Research Report:
+    {draft}
+
+    ### SCORING RULES
+    - Read each factual claim in the report.
+    - Check if the claim is supported by the source data.
+    - Ignore DATA_GAP entries — they are honest admissions, not errors.
+    - Score = (supported claims) / (total factual claims)
+
+    ### OUTPUT — return ONLY valid JSON, no markdown fences:
+    {{
+        "total_claims": <integer>,
+        "supported_claims": <integer>,
+        "faithfulness_score": <float between 0.0 and 1.0>,
+        "reasoning": "<one sentence>"
+    }}
+    """
+
     try:
-        score = evaluate(
-            dataset, 
-            metrics=[faithfulness, answer_relevancy],
-            llm=judge_llm,
-            embeddings=fake_embeddings 
-        )
-        
-        eval_summary = f"Faithfulness: {score['faithfulness']:.2f}, Relevancy: {score['answer_relevancy']:.2f}"
-        print(f"📈 EVALUATION SCORES: {eval_summary}")
-        return {"eval_score": eval_summary}
-        
-    except Exception as e:
-        print(f"⚠️ RAGAS Scoring skipped due to: {e}")
-        return {"eval_score": "Evaluation failed - check API limits"}
+        response = llm.invoke(scoring_prompt)
+        clean = response.content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(clean)
+        faith  = round(float(result.get("faithfulness_score", 0.0)), 2)
+        total  = result.get("total_claims", "?")
+        supported = result.get("supported_claims", "?")
+        reasoning = result.get("reasoning", "")
+        summary = f"Faithfulness: {faith:.2f} ({supported}/{total} claims supported)"
+        log("eval_scores", faithfulness=faith, total=total, supported=supported)
+        print(f"  Score — {summary}")
+        print(f"  Reasoning: {reasoning}")
+        return {
+            "eval_score": summary,
+            "faithfulness_score": faith,
+            "relevancy_score": 0.0,
+        }
+    except (json.JSONDecodeError, Exception) as exc:
+        log("eval_error", error=str(exc))
+        print(f"  Scoring failed: {exc}")
+        return {
+            "eval_score": "Evaluation failed",
+            "faithfulness_score": 0.0,
+            "relevancy_score": 0.0,
+        }
+
+
+def reporter_node(state: ResearchState):
+    """
+    Convert raw scores into a structured investment grade + confidence score.
+    This is the output that makes the project stand out in demos and on a resume.
+    """
+    log("node_start", node="reporter")
+    print("\n--- AGENT: REPORTER — generating investment verdict ---")
+
+    draft = state.get("draft_report", "")
+    faith = state.get("faithfulness_score", 0.0)
+    iterations = state.get("iterations", 1)
+
+    # Count DATA_GAP markers in the draft report
+    data_gap_count = draft.upper().count("DATA_GAP:")
+
+    # Count risk mentions
+    risk_keywords = ["lawsuit", "regulatory", "sec", "investigation", "fine", "risk", "recall"]
+    risk_flag_count = sum(draft.lower().count(kw) for kw in risk_keywords)
+
+    # Confidence: penalise for iterations used and data gaps
+    raw_confidence = faith * 100
+    iteration_penalty = (iterations - 1) * 12
+    gap_penalty = data_gap_count * 8
+    confidence_pct = max(0, min(100, int(raw_confidence - iteration_penalty - gap_penalty)))
+
+    # Investment grade based on faithfulness + confidence
+    if faith >= 0.85 and confidence_pct >= 75:
+        grade = "A"
+    elif faith >= 0.75 and confidence_pct >= 60:
+        grade = "B+"
+    elif faith >= 0.65 and confidence_pct >= 50:
+        grade = "B"
+    elif faith >= 0.50 and confidence_pct >= 35:
+        grade = "C"
+    else:
+        grade = "D"
+
+    sources_cited = state.get("sources_cited", 0)
+
+    print(f"\n{'='*55}")
+    print(f"  INVESTMENT GRADE : {grade}")
+    print(f"  CONFIDENCE       : {confidence_pct}%")
+    print(f"  FAITHFULNESS     : {faith:.2f}")
+    print(f"  DATA GAPS        : {data_gap_count}")
+    print(f"  RISK FLAGS       : {risk_flag_count}")
+    print(f"  SOURCES CITED    : {sources_cited}")
+    print(f"  ITERATIONS USED  : {iterations} / 3")
+    print(f"{'='*55}\n")
+
+    log(
+        "report_generated",
+        grade=grade,
+        confidence_pct=confidence_pct,
+        data_gaps=data_gap_count,
+        risk_flags=risk_flag_count,
+    )
+
+    return {
+        "investment_grade": grade,
+        "confidence_pct": confidence_pct,
+        "data_gap_count": data_gap_count,
+        "risk_flag_count": risk_flag_count,
+    }

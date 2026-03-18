@@ -1,0 +1,11 @@
+langgraph
+langchain
+langchain-openai
+langchain-community
+langchain-huggingface
+sentence-transformers
+tavily-python
+ragas
+datasets
+tenacity
+python-dotenv

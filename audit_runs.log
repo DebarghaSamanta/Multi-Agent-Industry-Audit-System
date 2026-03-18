@@ -1,0 +1,17 @@
+{"ts": 1773842725.2080328, "event": "run_start", "thread_id": "audit_3bb52f3b"}
+{"ts": 1773842725.3268905, "event": "node_start", "node": "planner", "iteration": 0}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773842726.0700672, "event": "node_done", "node": "planner", "queries": ["Tesla revenue growth 2024-2025 and profit margins analysis", "Tesla market share in global electric vehicle industry and competitors 2024", "Tesla lawsuits and regulatory issues affecting revenue growth 2024-2025"]}
+{"ts": 1773843892.5782697, "event": "node_start", "node": "researcher", "num_queries": 3}
+{"ts": 1773843895.227528, "event": "search_done", "parallel_ms": 2648, "chunks_collected": 15}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773843896.844579, "event": "node_done", "node": "researcher", "sources_cited": 15}
+{"ts": 1773843896.8669648, "event": "node_start", "node": "auditor", "model": "llama-3.3-70b-versatile"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773843897.3558798, "event": "node_done", "node": "auditor", "is_verified": true}
+{"ts": 1773843897.3588414, "event": "router_decision", "decision": "verified", "iterations": 1}
+{"ts": 1773843897.367498, "event": "node_start", "node": "evaluator"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1773843897.866557, "event": "eval_scores", "faithfulness": 0.64, "total": 14, "supported": 9}
+{"ts": 1773843897.8730872, "event": "node_start", "node": "reporter"}
+{"ts": 1773843897.8794327, "event": "report_generated", "grade": "C", "confidence_pct": 48, "data_gaps": 2, "risk_flags": 5}
