@@ -32,3 +32,26 @@ HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200
 {"ts": 1773844208.9383476, "event": "eval_scores", "faithfulness": 0.75, "total": 12, "supported": 9}
 {"ts": 1773844208.9452615, "event": "node_start", "node": "reporter"}
 {"ts": 1773844208.9522216, "event": "report_generated", "grade": "B", "confidence_pct": 59, "data_gaps": 2, "risk_flags": 2}
+{"ts": 1774545605.480267, "event": "run_start", "thread_id": "audit_7f9179e3"}
+{"ts": 1774545606.0256674, "event": "node_start", "node": "planner", "iteration": 0}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1774545606.745391, "event": "node_done", "node": "planner", "iteration": 0, "queries": ["Tesla revenue growth 2024-2025 financial reports", "Tesla market share global electric vehicle industry competitors 2024", "Tesla SEC filings regulatory issues lawsuits 2024-2025 risk assessment"]}
+{"ts": 1774546083.884633, "event": "node_start", "node": "researcher", "num_queries": 3}
+{"ts": 1774546086.3807766, "event": "search_done", "parallel_ms": 2492, "chunks_collected": 15, "retrieval_failed": false, "failed_query_count": 0}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1774546088.4999642, "event": "node_done", "node": "researcher", "sources_cited": 15}
+{"ts": 1774546088.5125806, "event": "node_start", "node": "auditor", "model": "llama-3.3-70b-versatile"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1774546089.771516, "event": "node_done", "node": "auditor", "is_verified": true}
+{"ts": 1774546089.7789593, "event": "router_decision", "decision": "verified", "iterations": 1}
+{"ts": 1774546089.784398, "event": "node_start", "node": "evaluator"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1774546090.6087875, "event": "eval_scores", "faithfulness": 0.88, "relevancy": 0.5, "completeness": 0.5, "hallucination_risk": "LOW"}
+{"ts": 1774546090.6241305, "event": "node_start", "node": "refusal"}
+{"ts": 1774546090.6273735, "event": "refusal_passed"}
+{"ts": 1774546090.6602006, "event": "node_start", "node": "grounding"}
+HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+{"ts": 1774546092.3932047, "event": "grounding_done", "grounding_rate": 0.89, "grounding_passed": true, "unverified_count": 1}
+{"ts": 1774546092.3997362, "event": "node_start", "node": "reporter"}
+{"ts": 1774546092.4050212, "event": "report_generated", "grade": "B", "confidence_pct": 65, "data_gaps": 0, "risk_flags": 1, "hallucination_risk": "LOW", "grounding_passed": true}
+{"ts": 1774546092.7161326, "event": "system_crash", "error": "table runs has no column named completeness"}
